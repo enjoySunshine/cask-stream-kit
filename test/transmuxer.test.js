@@ -4103,7 +4103,13 @@ QUnit.test('reuses audio track object when the pipeline reconfigures itself', fu
 
   boxes = mp4.tools.inspect(segments[1].data);
 
-  assert.equal(boxes[0].boxes[1].boxes[1].baseMediaDecodeTime,
+  // the ID3 tag is embedded as an emsg box ahead of the media fragment
+  assert.equal(boxes[0].type, 'emsg', 'second segment leads with an emsg box');
+  var moofBox = boxes.filter(function(box) {
+    return box.type === 'moof';
+  })[0];
+
+  assert.equal(moofBox.boxes[1].boxes[1].baseMediaDecodeTime,
     // The first segment had a PTS of 10,000 and the second segment 900,000
     // Audio PTS is specified in a clock equal to samplerate (44.1khz)
     // So you have to take the different between the PTSs (890,000)

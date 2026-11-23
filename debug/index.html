@@ -82,6 +82,10 @@ mp4fragment --track audio --fragment-duration 11000 movie-audio.mp4 movie-audio.
                 <label><input id="reset-tranmsuxer" type=checkbox name=reset checked value="reset">&nbsp;Recreate the Transmuxer &amp; MediaSource for each file open?
                 </label>
               </div>
+              <div>
+                <label><input id="keep-original-timestamps" type=checkbox name=keepOriginal value="keepOriginal">&nbsp;Keep original timestamps (instead of shifting to the segment start)?
+                </label>
+              </div>
             </fieldset>
             <fieldset>
               <legend>MP4 Input</legend>
@@ -108,6 +112,20 @@ mp4fragment --track audio --fragment-duration 11000 movie-audio.mp4 movie-audio.
             A diff of the structure of the two MP4s will appear here
             once you've specified an input TS file and a known working
             MP4.
+          </div>
+        </section>
+        <section>
+          <h2>Timed Metadata (Scores)</h2>
+          <p>
+            The left column is the time reported by the transmuxer as it
+            emits the score. The right column is the time probed back out of
+            the media bytes that were written, as they would be read from a
+            saved fragment on another day.
+          </p>
+          <div id="metadata-compare">
+            No timed metadata has been seen yet. Load
+            <code>test-aac-segment.aac</code> to see the
+            <code>com.apple.streaming.transportStreamTimestamp</code> score.
           </div>
         </section>
         <section>
@@ -163,6 +181,7 @@ mp4fragment --track audio --fragment-duration 11000 movie-audio.mp4 movie-audio.
       vjsBoxes = $('.vjs-boxes'),
       workingBoxes = $('.working-boxes'),
       workingBoxes = $('.working-boxes'),
+      metadataCompare = $('#metadata-compare'),
 
       muxedData,
       muxedName,
@@ -170,7 +189,56 @@ mp4fragment --track audio --fragment-duration 11000 movie-audio.mp4 movie-audio.
       video,
       mediaSource,
       logevent,
-      prepareSourceBuffer;
+      prepareSourceBuffer,
+      reportedMetadata,
+      muxedInitSegment;
+
+    // Render the side-by-side comparison of the time the transmuxer reported
+    // for each score and the time probed back out of the stored media bytes.
+    renderMetadataComparison = function() {
+      if (!muxedData || !reportedMetadata || !reportedMetadata.length) {
+        return;
+      }
+
+      // Probe the saved media bytes (everything after the init segment), the
+      // same way a player reopening a stored fragment would.
+      var mediaBytes = muxedInitSegment &&
+        muxedInitSegment.byteLength < muxedData.byteLength ?
+        muxedData.subarray(muxedInitSegment.byteLength) : muxedData;
+      var probed;
+
+      try {
+        probed = muxjs.mp4.probe.getEmsgID3(mediaBytes);
+      } catch (err) {
+        probed = [];
+      }
+
+      var rows = reportedMetadata.map(function(tag, index) {
+        var frame = tag.frames && tag.frames[0] ? tag.frames[0] : {};
+        var probedTag = probed[index];
+        var probedTime = probedTag ? probedTag.cueTime : null;
+        var match = probedTag &&
+          Math.abs(probedTag.cueTime - tag.cueTime) <= (1 / 90000);
+
+        return '<tr>' +
+          '<td>' + index + '</td>' +
+          '<td>' + (frame.id || '') + '</td>' +
+          '<td>' + (frame.owner || '') + '</td>' +
+          '<td>' + tag.cueTime + '</td>' +
+          '<td>' + (probedTime === null ? 'not found' : probedTime) + '</td>' +
+          '<td>' + (match ? 'yes' : 'NO') + '</td>' +
+          '</tr>';
+      }).join('');
+
+      metadataCompare.innerHTML =
+        '<table border="1" cellpadding="6" cellspacing="0">' +
+        '<thead><tr>' +
+        '<th>#</th><th>Frame</th><th>Owner</th>' +
+        '<th>Reported time (seconds)</th>' +
+        '<th>Probed from media bytes (seconds)</th>' +
+        '<th>Match (&le; 1/90000)</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table>';
+    };
 
     logevent = function(event) {
       console.log(event.type);
@@ -295,12 +363,15 @@ mp4fragment --track audio --fragment-duration 11000 movie-audio.mp4 movie-audio.
         return;
       }
 
+      metadataCompare.innerHTML = 'Transmuxing...';
+
       reader.addEventListener('loadend', function() {
 
         var segment = new Uint8Array(reader.result),
             combined = document.querySelector('#combined-output').checked,
             outputType = document.querySelector('input[name="output"]:checked').value,
             resetTransmuxer = $('#reset-tranmsuxer').checked,
+            keepOriginalTimestamps = $('#keep-original-timestamps').checked,
             remuxedSegments = [],
             remuxedInitSegment = null,
             remuxedBytesLength = 0,
@@ -310,11 +381,17 @@ mp4fragment --track audio --fragment-duration 11000 movie-audio.mp4 movie-audio.
 
         if (resetTransmuxer || !transmuxer) {
           createInitSegment = true;
+          reportedMetadata = [];
           if (combined) {
               outputType = 'combined';
-              transmuxer = new muxjs.mp4.Transmuxer();
+              transmuxer = new muxjs.mp4.Transmuxer({
+                keepOriginalTimestamps: keepOriginalTimestamps
+              });
           } else {
-              transmuxer = new muxjs.mp4.Transmuxer({remux: false});
+              transmuxer = new muxjs.mp4.Transmuxer({
+                remux: false,
+                keepOriginalTimestamps: keepOriginalTimestamps
+              });
           }
 
           transmuxer.on('data', function(event) {
@@ -323,6 +400,11 @@ mp4fragment --track audio --fragment-duration 11000 movie-audio.mp4 movie-audio.
               remuxedBytesLength += event.data.byteLength;
               remuxedInitSegment = event.initSegment;
             }
+          });
+
+          // record the scores exactly as the transmuxer reports them
+          transmuxer.on('id3Frame', function(id3Frame) {
+            reportedMetadata.push(id3Frame);
           });
 
           transmuxer.on('done', function () {
@@ -341,6 +423,9 @@ mp4fragment --track audio --fragment-duration 11000 movie-audio.mp4 movie-audio.
               i += remuxedSegments[j].byteLength;
             }
             muxedData = bytes;
+            if (createInitSegment) {
+              muxedInitSegment = remuxedInitSegment;
+            }
             remuxedSegments = [];
             remuxedBytesLength = 0;
 
@@ -348,6 +433,9 @@ mp4fragment --track audio --fragment-duration 11000 movie-audio.mp4 movie-audio.
             vjsParsed = muxjs.mp4.tools.inspect(bytes);
             console.log('transmuxed', vjsParsed);
             diffParsed();
+
+            // show the reported vs re-probed score times side by side
+            renderMetadataComparison();
 
             // clear old box info
             vjsBoxes.innerHTML = muxjs.mp4.tools.textify(vjsParsed, null, ' ');
@@ -407,6 +495,12 @@ mp4fragment --track audio --fragment-duration 11000 movie-audio.mp4 movie-audio.
           .forEach(function (el) {
             el.disabled = this.checked;
           }, this);
+    });
+
+    // the timestamp mode is fixed when a transmuxer is constructed, so make
+    // sure the next file open recreates the transmuxer when the mode changes
+    $('#keep-original-timestamps').addEventListener('change', function () {
+      $('#reset-tranmsuxer').checked = true;
     });
 
     [].slice.call(document.querySelectorAll('input')).forEach(function(el){
